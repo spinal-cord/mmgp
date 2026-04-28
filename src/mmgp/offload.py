@@ -826,7 +826,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.5) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.6) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1760,7 +1760,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}, ignore_missing_keys = False):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1846,7 +1846,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
 
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel , ignore_missing_keys = ignore_missing_keys)
 
     return model
 
@@ -2181,8 +2181,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         _requantize(model, state_dict, quantization_map, default_dtype=default_dtype)    
 
     missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
-    if len(missing_keys) > 0  :
-        # if there is a key mismatch maybe we forgot to remove some prefix
+    if len(missing_keys) > 0 and not ignore_missing_keys:
         base_model_prefix = None
         for k,v in state_dict.items():
             if k.endswith(missing_keys[0]):
@@ -2191,11 +2190,8 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         if base_model_prefix == None:
             if not ignore_missing_keys:
                 raise Exception(f"Missing keys: {missing_keys}")
-        else:
-            state_dict = filter_state_dict_basic(state_dict, base_model_prefix)
-            missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
-            if len(missing_keys) > 0 and not ignore_missing_keys:
-                raise Exception(f"Missing keys: {missing_keys}")
+            elif verboseLevel >= 1:
+                print(f"Ignoring missing keys: {missing_keys}")
         
     del state_dict
 
@@ -2528,6 +2524,38 @@ class offload:
 
         return blocks_params_size
 
+    def add_block_tensors(self, model_id, blocks_name, parent_module, param_names, is_buffer_flags):
+        """
+        Explicitly add named tensors to the offloader's block list.
+        param_names: list of attribute names (e.g. ['packed_weight','scales','bias'])
+        is_buffer_flags: parallel list of booleans (True if it's a buffer, False if a parameter)
+        """
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        if entry_name not in self.blocks_of_modules:
+            raise KeyError(f"Block entry '{entry_name}' not found in offloader.")
+        blocks_params = self.blocks_of_modules[entry_name]
+        for name, is_buffer in zip(param_names, is_buffer_flags):
+            tensor = getattr(parent_module, name)
+            param_size = tensor.numel() * tensor.element_size()
+            blocks_params.append((parent_module, name, tensor, is_buffer, None))
+            self.blocks_of_modules_sizes[entry_name] += param_size
+
+    def remove_block_tensors(self, model_id, blocks_name, parent_module, param_names):
+        """
+        Remove entries for specific tensors from the offloader's block list.
+        """
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        if entry_name not in self.blocks_of_modules:
+            return
+        blocks_params = self.blocks_of_modules[entry_name]
+        to_remove = []
+        for i, (mod, name, tensor, is_buf, tied) in enumerate(blocks_params):
+            if mod is parent_module and name in param_names:
+                param_size = tensor.numel() * tensor.element_size()
+                self.blocks_of_modules_sizes[entry_name] -= param_size
+                to_remove.append(i)
+        for i in reversed(to_remove):
+            del blocks_params[i]
 
     def can_model_be_cotenant(self, model_id):
         potential_cotenants= self.cotenants_map.get(model_id, None)
